@@ -95,7 +95,7 @@ class DomainUserScriptTests: XCTestCase {
     }
   }
 
-  func testSoundCloudMediaSessionAvailability() throws {
+  func testSoundCloudAvailability() throws {
     let goodURLs = [
       URL(string: "https://soundcloud.com"),
       URL(string: "https://soundcloud.com/some-artist/some-track"),
@@ -106,12 +106,12 @@ class DomainUserScriptTests: XCTestCase {
     goodURLs.forEach {
       XCTAssertEqual(
         DomainUserScript(for: $0, isPrivateBrowsing: false),
-        .soundCloudMediaSession,
+        .soundCloud,
         "\($0) failed"
       )
       XCTAssertEqual(
         DomainUserScript(for: $0, isPrivateBrowsing: true),
-        .soundCloudMediaSession,
+        .soundCloud,
         "\($0) failed in private browsing"
       )
     }
@@ -127,7 +127,7 @@ class DomainUserScriptTests: XCTestCase {
     badURLs.forEach {
       XCTAssertNotEqual(
         DomainUserScript(for: $0, isPrivateBrowsing: false),
-        .soundCloudMediaSession
+        .soundCloud
       )
     }
   }

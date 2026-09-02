@@ -12,7 +12,7 @@ enum DomainUserScript: CaseIterable {
   case braveSearchHelper
   case braveTalkHelper
   case braveSkus
-  case soundCloudMediaSession
+  case soundCloud
 
   /// Initialize this script with a URL
   init?(for url: URL, isPrivateBrowsing: Bool) {
@@ -59,7 +59,7 @@ enum DomainUserScript: CaseIterable {
         "account.bravesoftware.com",
         "account.brave.software",
       ])
-    case .soundCloudMediaSession:
+    case .soundCloud:
       // eTLD+1 matching in `init(for:)` also covers m./www./on.soundcloud.com.
       return Set(["soundcloud.com"])
     }
@@ -67,7 +67,7 @@ enum DomainUserScript: CaseIterable {
 
   var isAllowedInPrivateMode: Bool {
     switch self {
-    case .braveSearchHelper, .braveTalkHelper, .soundCloudMediaSession:
+    case .braveSearchHelper, .braveTalkHelper, .soundCloud:
       return true
     case .braveSkus:
       return false

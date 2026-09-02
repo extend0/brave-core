@@ -7,11 +7,13 @@ import Foundation
 import Web
 import WebKit
 
-/// Registers Media Session `nexttrack`/`previoustrack` handlers on SoundCloud's
-/// mobile web app so iOS lock screen and headphone controls change tracks
-/// instead of seeking 15 seconds. The script never posts messages to native.
-class SoundCloudMediaSessionScriptHandler: TabContentScript {
-  static let scriptName = "SoundCloudMediaSessionScript"
+/// Page-world fixes for SoundCloud's mobile web app: registers Media Session
+/// `nexttrack`/`previoustrack` handlers so lock screen and headphone controls
+/// change tracks instead of seeking 15 seconds, and adds an ordered "Play"
+/// button to playlist pages, which otherwise only offer "Shuffle play".
+/// The script never posts messages to native.
+class SoundCloudScriptHandler: TabContentScript {
+  static let scriptName = "SoundCloudScript"
   static let scriptId = UUID().uuidString
   static let messageHandlerName = "\(scriptName)_\(messageUUID)"
   static let scriptSandbox: WKContentWorld = .page
