@@ -80,6 +80,14 @@ class ScriptFactory {
       }
 
       return script
+
+    case .soundCloudMediaSession:
+      guard let script = SoundCloudMediaSessionScriptHandler.userScript else {
+        assertionFailure("Cannot load script. This should not happen as it's part of the codebase")
+        throw ScriptLoadFailure.notFound
+      }
+
+      return script
     }
   }
 

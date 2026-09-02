@@ -94,4 +94,41 @@ class DomainUserScriptTests: XCTestCase {
       XCTAssertNotEqual(DomainUserScript(for: $0, isPrivateBrowsing: false), .braveSkus)
     }
   }
+
+  func testSoundCloudMediaSessionAvailability() throws {
+    let goodURLs = [
+      URL(string: "https://soundcloud.com"),
+      URL(string: "https://soundcloud.com/some-artist/some-track"),
+      URL(string: "https://m.soundcloud.com/discover"),
+      URL(string: "https://on.soundcloud.com/abc123"),
+    ].compactMap { $0 }
+
+    goodURLs.forEach {
+      XCTAssertEqual(
+        DomainUserScript(for: $0, isPrivateBrowsing: false),
+        .soundCloudMediaSession,
+        "\($0) failed"
+      )
+      XCTAssertEqual(
+        DomainUserScript(for: $0, isPrivateBrowsing: true),
+        .soundCloudMediaSession,
+        "\($0) failed in private browsing"
+      )
+    }
+
+    let badURLs = [
+      URL(string: "https://soundcloud.com.evil.example"),
+      URL(string: "https://notsoundcloud.com"),
+      URL(string: "https://sndcdn.com"),
+      URL(string: "https://talk.brave.com"),
+      URL(string: "https://brave.com"),
+    ].compactMap { $0 }
+
+    badURLs.forEach {
+      XCTAssertNotEqual(
+        DomainUserScript(for: $0, isPrivateBrowsing: false),
+        .soundCloudMediaSession
+      )
+    }
+  }
 }

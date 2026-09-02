@@ -234,6 +234,9 @@ var package = Package(
         .copy(
           "Frontend/UserContent/UserScripts/Scripts_Dynamic/Scripts/DomainSpecific/Paged/BraveTalkScript.js"
         ),
+        .copy(
+          "Frontend/UserContent/UserScripts/Scripts_Dynamic/Scripts/DomainSpecific/Paged/SoundCloudMediaSessionScript.js"
+        ),
       ],
       plugins: ["LoggerPlugin"]
     ),
