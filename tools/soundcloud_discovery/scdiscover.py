@@ -190,10 +190,14 @@ class Client:
     if not pl:
       return None, []
     tracks = pl.get("tracks", [])
-    full = [t for t in tracks if "title" in t]
+    by_id = {t["id"]: t for t in tracks if "title" in t}
     stubs = [t["id"] for t in tracks if "title" not in t]
-    full.extend(self.hydrate_tracks(stubs))
-    return pl, full
+    for t in self.hydrate_tracks(stubs):
+      by_id[t["id"]] = t
+    # Keep the playlist's own order: SoundCloud appends new adds at the end,
+    # so position is the only hint we get about when a track was added.
+    ordered = [by_id[t["id"]] for t in tracks if t["id"] in by_id]
+    return pl, ordered
 
 
 # ---------------------------------------------------------------------------
@@ -240,15 +244,19 @@ class Track:
 
 class Context:
   """A list of tracks made by a human: a playlist, or a user's likes."""
-  __slots__ = ("kind", "id", "title", "owner", "track_ids", "seed_hits")
+  __slots__ = ("kind", "id", "title", "owner", "track_ids", "order", "seed_hits",
+               "created", "modified")
 
-  def __init__(self, kind, id_, title, owner, track_ids):
+  def __init__(self, kind, id_, title, owner, track_ids, created=None, modified=None):
     self.kind = kind
     self.id = id_
     self.title = title
     self.owner = owner
+    self.order = list(track_ids)
     self.track_ids = set(track_ids)
     self.seed_hits = 0
+    self.created = parse_date(created)
+    self.modified = parse_date(modified)
 
 
 class Recommender:
@@ -260,6 +268,8 @@ class Recommender:
     self.contexts = {}  # (kind,id) -> Context
     self.seed_ids = []
     self.exclude_ids = set()
+    self.user_seeds = {}  # user id -> set of seed/secondary track ids they liked
+    self.user_info = {}
 
   def remember(self, raw_tracks):
     for t in raw_tracks:
@@ -325,7 +335,8 @@ class Recommender:
       self.remember(tracks)
       ctx = Context("playlist", pl["id"], pl.get("title") or "?",
                     (pl.get("user") or {}).get("username") or "?",
-                    [t["id"] for t in tracks])
+                    [t["id"] for t in tracks],
+                    created=pl.get("created_at"), modified=pl.get("last_modified"))
       self.contexts[("playlist", pl["id"])] = ctx
     log(f"hydrated {len(self.contexts)} playlists")
 
@@ -495,6 +506,229 @@ class Recommender:
     upcoming.sort(key=lambda x: -x["upcoming"])
     return crowd, self.cap_per_artist(upcoming, a.per_artist)
 
+  # -- rising: timestamped adoption by taste neighbours ------------------------
+
+  def collect_neighbours(self, track_ids, pages, label):
+    """Record who liked or reposted each of `track_ids`. Heavy likers
+    (hoarders, bots) are skipped: their likes say little."""
+    a = self.a
+    for i, tid in enumerate(track_ids):
+      for path in (f"/tracks/{tid}/likers", f"/tracks/{tid}/reposters"):
+        for u in self.c.collection(path, pages=pages, limit=100):
+          n = u.get("likes_count") or 0
+          if not (20 <= n <= a.neighbour_max_likes):
+            continue
+          self.user_seeds.setdefault(u["id"], set()).add(tid)
+          self.user_info[u["id"]] = u
+      log(f"[{i + 1}/{len(track_ids)}] {label} of {tid}: {len(self.user_seeds)} people so far")
+
+  def rank_neighbours(self, seed_ids, weight_scale=1.0, exclude=()):
+    """Weight people by how many of `seed_ids` they touched, diluted by how
+    indiscriminate they are."""
+    a = self.a
+    seeds = set(seed_ids)
+    seed_artists = self.seed_artists()
+    ranked = []
+    for uid, touched in self.user_seeds.items():
+      if uid in exclude:
+        continue
+      h = len(touched & seeds)
+      if h == 0:
+        continue
+      u = self.user_info[uid]
+      if u.get("username") in seed_artists:
+        continue
+      w = weight_scale * (h ** a.seed_overlap_power) / math.log((u.get("likes_count") or 0) + 10)
+      ranked.append((w, h, u))
+    ranked.sort(key=lambda x: -x[0])
+    return ranked
+
+  def neighbour_feed(self, uid):
+    a = self.a
+    feed = []
+    for x in self.c.collection(f"/users/{uid}/likes", pages=a.neighbour_like_pages, limit=50):
+      if x.get("track"):
+        feed.append((x["track"], x.get("created_at"), 1.0))
+    for x in self.c.collection(f"/stream/users/{uid}/reposts", pages=1, limit=50):
+      if x.get("track") and x.get("type", "").startswith("track"):
+        feed.append((x["track"], x.get("created_at"), 2.0))
+    return feed
+
+  def rising(self, rows, budget_scale=1.0):
+    """Score tracks by *when* taste neighbours adopted them, not how many
+    plays they have. Each like/repost event decays with a half-life, so a
+    track being picked up by your scene this month outranks one they all
+    liked two years ago. Reposts weigh double: a repost is public curation."""
+    a = self.a
+    if a.neighbours <= 0:
+      return [], 0
+    now = dt.datetime.now(dt.timezone.utc)
+    seeds = set(self.seed_ids)
+    score = collections.Counter()
+    people = collections.defaultdict(set)
+    latest = {}
+    events = collections.Counter()
+    neighbour_people = collections.defaultdict(set)
+
+    def vote(tid, person, when_days, weight):
+      decay = 0.5 ** (max(when_days, 0) / a.half_life_days)
+      score[tid] += weight * decay
+      people[tid].add(person)
+      events[tid] += 1
+      latest[tid] = min(latest.get(tid, 10 ** 6), when_days)
+
+    # Source 1: playlists from the co-occurrence pass. We never learn when a
+    # track was added, but new adds land at the end of a list, so the last
+    # quarter of a recently modified playlist gets the modification date and
+    # everything else the midpoint of the list's life. Weak timestamps, weak
+    # weight, but many independent people.
+    for ctx in self.contexts.values():
+      hits = len(ctx.track_ids & seeds)
+      if hits == 0 or ctx.kind != "playlist":
+        continue
+      if len(seeds) >= 5 and hits / len(seeds) > a.max_seed_fraction:
+        continue
+      w = a.playlist_vote * (hits ** a.seed_overlap_power) / math.log(len(ctx.order) + 10)
+      mod_days = (now - ctx.modified).days if ctx.modified else 365
+      created_days = (now - ctx.created).days if ctx.created else mod_days + 365
+      mid_days = (mod_days + created_days) / 2
+      tail = int(len(ctx.order) * 0.75)
+      for pos, tid in enumerate(ctx.order):
+        if tid in seeds or tid in self.exclude_ids:
+          continue
+        vote(tid, ("pl", ctx.owner), mod_days if pos >= tail else mid_days, w)
+
+    # Source 2: taste neighbours' timestamped likes and reposts.
+    def ingest(neighbours):
+      for w, h, u in neighbours:
+        uid = u["id"]
+        for t, when, kind_w in self.neighbour_feed(uid):
+          tid = t["id"]
+          if tid in seeds or tid in self.exclude_ids:
+            continue
+          self.remember([t])
+          d = parse_date(when)
+          vote(tid, ("u", uid), (now - d).days if d else 365, w * kind_w)
+          neighbour_people[tid].add(uid)
+
+    if not self.user_seeds:
+      self.collect_neighbours(self.seed_ids, a.neighbour_pages, "likers")
+    n1 = a.neighbours if budget_scale > 0 else min(a.neighbours, a.loose_neighbours)
+    round1 = self.rank_neighbours(self.seed_ids)[:n1]
+    ingest(round1)
+    used = {u["id"] for _, _, u in round1}
+    n_neighbours = len(round1)
+
+    # Snowball: tracks several first-round neighbours converged on are, in
+    # effect, extra seeds. Their likers are people we would never have found
+    # from the original seeds alone, and they were selected for taste rather
+    # than for happening to like one track.
+    n_sb_seeds = int(a.snowball_seeds * budget_scale)
+    n_sb_neighbours = int(a.snowball_neighbours * budget_scale)
+    if n_sb_seeds > 0 and n_sb_neighbours > 0:
+      agreed = [(len(v), tid) for tid, v in neighbour_people.items()
+                if len(v) >= a.snowball_min_people and tid in self.tracks
+                and self.tracks[tid].artist_followers <= a.rising_max_artist_followers]
+      agreed.sort(reverse=True)
+      secondary = [tid for _, tid in agreed[:n_sb_seeds]]
+      if secondary:
+        log(f"snowball: {len(secondary)} tracks agreed on by {a.snowball_min_people}+ neighbours")
+        self.collect_neighbours(secondary, 1, "likers (snowball)")
+        round2 = self.rank_neighbours(secondary, a.snowball_weight, exclude=used)
+        round2 = round2[:n_sb_neighbours]
+        ingest(round2)
+        n_neighbours += len(round2)
+    log(f"rising: {n_neighbours} neighbours, {len(score)} tracks with votes")
+
+    seed_artists = self.seed_artists()
+    out = []
+    pool = [self.tracks[t] for t in score if t in self.tracks]
+    vel = [t.plays / max(t.age_days or 30, 30) for t in pool if t.plays]
+    med_vel = self.percentile(vel, 0.5) or 1.0
+    cooc = {x["track"].id: x for x in rows}
+    for tid, sc in score.items():
+      t = self.tracks.get(tid)
+      if not t or len(people[tid]) < a.min_contexts:
+        continue
+      if not a.include_seed_artists and t.artist in seed_artists:
+        continue
+      if not (a.rising_min_plays <= t.plays <= a.rising_max_plays):
+        continue
+      if t.likes > a.max_like_ratio * max(t.plays, 1):
+        continue
+      if latest[tid] > a.rising_max_event_days:
+        continue
+      if t.age_days is not None and t.age_days > a.rising_max_age_days:
+        continue
+      if t.artist_followers > a.rising_max_artist_followers:
+        continue
+      # Velocity: plays per day of life, relative to the pool. A 60k-play track
+      # from four months ago is moving faster than a 400k one from 2019.
+      velocity = (t.plays / max(t.age_days or 30, 30)) / med_vel
+      # Concentration: how much of the track's whole audience is *your*
+      # neighbours, recently. Small denominators mean it is breaking in your
+      # scene specifically rather than everywhere.
+      concentration = len(people[tid]) / math.log10(t.likes + 10)
+      out.append({
+          "track": t,
+          "rising": sc * (velocity ** a.velocity_power) * concentration,
+          "raw": sc,
+          "contexts": events[tid],
+          "owners": len(people[tid]),
+          "max_seed_hits": cooc[tid]["max_seed_hits"] if tid in cooc else 0,
+          "latest_days": latest[tid],
+          "velocity": velocity,
+      })
+    out.sort(key=lambda x: -x["rising"])
+    return self.cap_per_artist(out, a.per_artist), n_neighbours
+
+  # -- seed clustering --------------------------------------------------------
+
+  def cluster_seeds(self):
+    """Group seeds that share playlists or likers. A mixed playlist is really
+    several taste profiles; scored together they cancel each other out."""
+    a = self.a
+    seeds = list(self.seed_ids)
+    if len(seeds) < a.cluster_min_seeds:
+      return [seeds], []
+    idx = {s: i for i, s in enumerate(seeds)}
+    sim = collections.Counter()
+    for ctx in self.contexts.values():
+      inside = [idx[t] for t in ctx.track_ids if t in idx]
+      if len(inside) / len(seeds) > a.max_seed_fraction and len(seeds) >= 5:
+        continue  # a copy of the input playlist links everything to everything
+      for i in inside:
+        for j in inside:
+          if i < j:
+            sim[(i, j)] += 1.0
+    if not self.user_seeds:
+      self.collect_neighbours(self.seed_ids, a.neighbour_pages, "likers")
+    for touched in self.user_seeds.values():
+      inside = sorted(idx[t] for t in touched if t in idx)
+      for i in inside:
+        for j in inside:
+          if i < j:
+            sim[(i, j)] += a.liker_link_weight
+    # Union-find over edges above the threshold.
+    parent = list(range(len(seeds)))
+
+    def find(x):
+      while parent[x] != x:
+        parent[x] = parent[parent[x]]
+        x = parent[x]
+      return x
+
+    for (i, j), w in sim.items():
+      if w >= a.cluster_link_threshold:
+        parent[find(i)] = find(j)
+    groups = collections.defaultdict(list)
+    for i, s in enumerate(seeds):
+      groups[find(i)].append(s)
+    clusters = sorted(groups.values(), key=len, reverse=True)
+    linked = [c for c in clusters if len(c) >= 2]
+    loose = [s for c in clusters if len(c) == 1 for s in c]
+    return linked, loose
+
   def soundcloud_related(self):
     """Baseline: SoundCloud's own related tracks, unioned across (a sample
     of) seeds and ranked by how many seeds recommended them."""
@@ -543,13 +777,17 @@ def print_table(title, rows, limit, score_key, show_url):
   top = rows[0][score_key] or 1.0
   rows = [dict(x, **{score_key: x[score_key] / top}) for x in rows[:limit]]
   hdr = (f"{'#':>3} {'score':>6} {'lists':>5} {'ppl':>4} {'seeds':>5} {'plays':>6} "
-         f"{'artist':>6} {'age':>4}  title")
-  print(hdr)
+         f"{'artist':>6} {'age':>4}  ")
+  if "latest_days" in rows[0]:
+    hdr += f"{'last':>4} {'speed':>6}  "
+  print(hdr + "title")
   for i, x in enumerate(rows[:limit], 1):
     t = x["track"]
     line = (f"{i:>3} {x[score_key]:>6.2f} {x['contexts']:>5} {x['owners']:>4} {x['max_seed_hits']:>5} "
-            f"{fmt_num(t.plays):>6} {fmt_num(t.artist_followers):>6} {fmt_age(t.age_days):>4}  "
-            f"{t.title[:60]} — {t.artist[:24]}")
+            f"{fmt_num(t.plays):>6} {fmt_num(t.artist_followers):>6} {fmt_age(t.age_days):>4}  ")
+    if "latest_days" in x:
+      line += f"{fmt_age(x['latest_days']):>4} {x['velocity']:>5.1f}x  "
+    line += f"{t.title[:60]} — {t.artist[:24]}"
     print(line)
     if show_url:
       print(f"{'':>45}{t.url}")
@@ -564,6 +802,8 @@ def rows_to_json(rows, score_key, limit):
         "plays": t.plays, "likes": t.likes, "artist_followers": t.artist_followers,
         "age_days": t.age_days, "genre": t.genre, "score": round(x[score_key], 4),
         "lists": x["contexts"], "people": x["owners"], "max_seed_hits": x["max_seed_hits"],
+        **({"latest_event_days": x["latest_days"], "velocity": round(x["velocity"], 2)}
+           if "latest_days" in x else {}),
     })
   return out
 
@@ -598,6 +838,40 @@ def build_parser():
                  help="also read this many likers' own likes per seed (0 = off)")
   g.add_argument("--related-seeds", type=int, default=10,
                  help="seeds to query SoundCloud's own related list for (baseline)")
+
+  g = p.add_argument_group("rising (taste-neighbour adoption)")
+  g.add_argument("--neighbours", type=int, default=100,
+                 help="taste neighbours to read likes/reposts from (0 = skip rising)")
+  g.add_argument("--neighbour-like-pages", type=int, default=2,
+                 help="pages of 50 likes to read per neighbour")
+  g.add_argument("--playlist-vote", type=float, default=0.5,
+                 help="weight of a playlist placement relative to a neighbour like")
+  g.add_argument("--snowball-seeds", type=int, default=15,
+                 help="tracks agreed on by first-round neighbours to use as extra seeds "
+                      "(0 = off)")
+  g.add_argument("--snowball-min-people", type=int, default=3,
+                 help="neighbours that must agree before a track becomes an extra seed")
+  g.add_argument("--snowball-neighbours", type=int, default=100,
+                 help="extra neighbours to read from the snowball round")
+  g.add_argument("--snowball-weight", type=float, default=0.6,
+                 help="weight of a snowball neighbour relative to a first-round one")
+  g.add_argument("--rising-max-artist-followers", type=int, default=500_000,
+                 help="major-label scale artists are not discovery; drop above this")
+  g.add_argument("--rising-max-age-days", type=int, default=1095,
+                 help="only tracks released within this many days can be rising; "
+                      "older revivals still show in crowd picks")
+  g.add_argument("--rising-max-event-days", type=int, default=120,
+                 help="drop tracks nobody touched within this many days")
+  g.add_argument("--neighbour-pages", type=int, default=1,
+                 help="pages of 100 likers and 100 reposters to scan per seed")
+  g.add_argument("--neighbour-max-likes", type=int, default=15000,
+                 help="ignore people with more likes than this (hoarders, bots)")
+  g.add_argument("--half-life-days", type=float, default=45,
+                 help="a like/repost this old counts half as much as one today")
+  g.add_argument("--velocity-power", type=float, default=0.5,
+                 help="weight of plays-per-day relative to the pool")
+  g.add_argument("--rising-min-plays", type=int, default=5000)
+  g.add_argument("--rising-max-plays", type=int, default=1_000_000)
 
   g = p.add_argument_group("scoring")
   g.add_argument("--seed-overlap-power", type=float, default=1.5,
@@ -638,6 +912,25 @@ def build_parser():
   g.add_argument("--include-seed-artists", action="store_true",
                  help="allow tracks by the seed tracks' own artists")
 
+  g = p.add_argument_group("clustering")
+  g.add_argument("--clusters", choices=["auto", "off"], default="off",
+                 help="also split seeds into taste clusters and score each separately. "
+                      "Off by default: every extra group costs a further neighbour pass, "
+                      "and the blended list plus snowball carries most of the value")
+  g.add_argument("--cluster-min-seeds", type=int, default=6)
+  g.add_argument("--cluster-link-threshold", type=float, default=1.0,
+                 help="two seeds join a cluster when shared playlists + weighted "
+                      "shared likers reach this")
+  g.add_argument("--liker-link-weight", type=float, default=0.34,
+                 help="a shared liker counts this much of a shared playlist")
+  g.add_argument("--cluster-limit", type=int, default=10, help="rows per list per cluster")
+  g.add_argument("--max-loose-seeds", type=int, default=6,
+                 help="unlinked seeds to report individually")
+  g.add_argument("--loose-neighbours", type=int, default=30,
+                 help="neighbours to read for each unlinked seed (about 3 requests each)")
+  g.add_argument("--cluster-snowball-scale", type=float, default=0.3,
+                 help="snowball budget for each cluster pass, as a fraction of the main one")
+
   g = p.add_argument_group("evaluation")
   g.add_argument("--holdout", type=float, default=0.0,
                  help="playlist input only: hide this fraction of tracks and report "
@@ -647,6 +940,7 @@ def build_parser():
 
 
 def main():
+  sys.stdout.reconfigure(line_buffering=True)
   args = build_parser().parse_args()
   rng = random.Random(args.seed)
   client = Client(use_cache=not args.no_cache, delay=args.delay)
@@ -672,6 +966,7 @@ def main():
   rows = rec.score()
   crowd, upcoming = rec.lists(rows)
   related = rec.soundcloud_related()
+  rising, n_neighbours = rec.rising(rows)
   log(f"api calls: {client.calls} (cache hits: {client.cache_hits}); "
       f"candidates scored: {len(rows)}")
 
@@ -681,6 +976,7 @@ def main():
         "soundcloud_related": rows_to_json(related, "raw", args.limit),
         "crowd_picks": rows_to_json(crowd, "raw", args.limit),
         "up_and_coming": rows_to_json(upcoming, "upcoming", args.limit),
+        "rising": rows_to_json(rising, "rising", args.limit),
         "held_out": held_out,
     }, indent=1))
   else:
@@ -694,13 +990,55 @@ def main():
     mp, mf = rec.upcoming_thresholds
     print_table(f"Up and coming (<= {fmt_num(mp)} plays, artist <= {fmt_num(mf)} followers)",
                 upcoming, args.limit, "upcoming", args.urls)
+    if args.neighbours > 0:
+      print_table(f"Rising (recently adopted by {n_neighbours} taste neighbours; "
+                  f"last = days since newest like/repost, speed = plays/day vs pool)",
+                  rising, args.limit, "rising", args.urls)
+
+  if args.clusters == "auto" and not args.json:
+    linked, loose = rec.cluster_seeds()
+    if loose or len(linked) > 1:
+      all_seeds = list(rec.seed_ids)
+
+      def label(t):
+        return f"{rec.tracks[t].title[:28]} ({rec.tracks[t].artist[:14]})" if t in rec.tracks else str(t)
+
+      print()
+      print(f"== Taste clusters: {len(linked)} linked group(s) and {len(loose)} unlinked "
+            f"seed(s) among {len(all_seeds)} seeds")
+      for ci, group in enumerate(linked, 1):
+        rec.seed_ids = group
+        names = ", ".join(label(t) for t in group[:3])
+        more = f" +{len(group) - 3} more" if len(group) > 3 else ""
+        print()
+        print(f"--- Cluster {ci}: {len(group)} seeds: {names}{more}")
+        c_rows = rec.score()
+        _, c_up = rec.lists(c_rows)
+        # Clusters reuse the neighbours already collected; a small snowball
+        # keeps the per-cluster cost to a fraction of the main pass.
+        c_rising, _ = rec.rising(c_rows, budget_scale=args.cluster_snowball_scale)
+        print_table("Rising", c_rising, args.cluster_limit, "rising", args.urls)
+        print_table("Up and coming", c_up, args.cluster_limit, "upcoming", args.urls)
+      # Seeds that share nothing with the rest get a cheap pass of their own:
+      # a few first-round neighbours, no snowball.
+      for t in loose[:args.max_loose_seeds]:
+        rec.seed_ids = [t]
+        print()
+        print(f"--- Unlinked seed: {label(t)}")
+        c_rows = rec.score()
+        c_rising, _ = rec.rising(c_rows, budget_scale=0.0)
+        print_table("Rising", c_rising, args.cluster_limit, "rising", args.urls)
+      if len(loose) > args.max_loose_seeds:
+        print(f"\n({len(loose) - args.max_loose_seeds} more unlinked seeds not shown; "
+              f"raise --max-loose-seeds)")
+      rec.seed_ids = all_seeds
 
   if held_out:
     ho = set(held_out)
     print()
     print(f"== Holdout evaluation: {len(ho)} hidden tracks, recall@{args.limit}")
     for name, lst in (("soundcloud related", related), ("crowd picks", crowd),
-                      ("up and coming", upcoming)):
+                      ("up and coming", upcoming), ("rising", rising)):
       top = [x["track"].id for x in lst[:args.limit]]
       hit = len(ho & set(top))
       anywhere = len(ho & {x["track"].id for x in lst})

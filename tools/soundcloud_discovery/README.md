@@ -3,7 +3,10 @@
 A local, dependency-free experiment in recommending SoundCloud tracks from
 *what other people file next to your music* instead of from SoundCloud's own
 recommendation engine. It exists to answer "is this signal useful?" before any
-of it is built into the browser.
+of it is built into the browser. Each run prints four lists: SoundCloud's own
+related tracks as a baseline, raw crowd picks, a popularity-normalised
+up-and-coming list, and a time-decayed "rising" list built from what people
+with your taste liked or reposted recently.
 
 ```
 python3 scdiscover.py https://soundcloud.com/oklou93/just-level-5-cause-its-kinda-cool
@@ -30,6 +33,9 @@ bundles on first run and refreshed automatically when it stops working.
      11 requests. This is how the "hundreds of hidden tracks" become visible.
    - `tracks/{id}/likers` → `users/{id}/likes` (optional, `--likers-per-seed`)
      – a heavy liker's likes list is treated as a pseudo-playlist.
+   - `tracks/{id}/likers`, `tracks/{id}/reposters` → `users/{id}/likes`,
+     `stream/users/{id}/reposts` – timestamped adoption events, for the
+     rising list.
    - `tracks/{id}/related` – SoundCloud's own recommendations, used only as
      the baseline column.
 3. **Score** every non-seed track:
@@ -50,7 +56,43 @@ bundles on first run and refreshed automatically when it stops working.
      (`--min-seed-hits`), which keeps single-seed off-genre lists out.
    - Tracks by the seed artists are excluded and each artist is capped at two
      rows (`--include-seed-artists`, `--per-artist`).
-4. **Evaluate** (playlists only, `--holdout`): hide a fraction of the playlist,
+4. **Rising** uses the one time series the API does expose. Play counts
+   have no history and comments are too sparse, but every like and repost
+   event carries a timestamp. The tool finds *taste neighbours*: people who
+   liked or reposted several of the seeds, weighted by how many and diluted
+   by how indiscriminate they are (hoarders and bots are excluded). It then
+   reads each neighbour's latest likes and reposts and scores each track by
+   `sum(neighbour_weight * kind * 0.5^(event_age / half_life))`, reposts
+   counting double. That base is multiplied by velocity (plays per day of
+   life relative to the pool, so a four-month-old 60k track beats a 2019
+   400k one), by concentration (neighbours who adopted it divided by the log
+   of its total likes, so a track breaking in *your* scene beats one
+   breaking everywhere), and by a bonus when the playlist pass saw it too.
+   Playlist placements from the co-occurrence pass vote too, at half
+   weight: a track in the last quarter of a recently modified list is dated
+   to that modification, everything else to the midpoint of the list's life.
+   Merging the sources roughly quintupled the list, because a track liked by
+   one neighbour and filed by one curator now has two people behind it.
+   The play band (`--rising-min/max-plays`, 5k to 1M) sits deliberately
+   above up-and-coming: this is the point on the curve where a track has
+   traction but is not yet everywhere. Tracks older than three years or by
+   artists with 500k+ followers are left to the other lists. Columns `last`
+   and `speed` show days since the newest neighbour event and the velocity
+   multiple.
+   **Snowball.** Tracks that three or more first-round neighbours converged
+   on are treated as extra seeds: their likers and reposters are collected
+   too, ranked by how many of those tracks they touched, and their feeds are
+   read at reduced weight (`--snowball-*`). These are people the original
+   seeds could never have reached, selected for taste rather than for
+   happening to like one track. It roughly doubles the neighbour pool.
+5. **Cluster** (`--clusters auto`, off by default): seeds are linked when
+   they share a playlist or a liker, connected groups become taste clusters,
+   and each cluster plus each unlinked seed gets its own rising pass after
+   the overall lists. It helps on a mixed playlist, whose seeds cancel each
+   other out when scored together, but every group is another neighbour
+   pass, so an 8-track grab bag cost roughly 1,500 requests and 15 minutes.
+   Left opt-in for that reason.
+6. **Evaluate** (playlists only, `--holdout`): hide a fraction of the playlist,
    recommend from the rest, report how many hidden tracks each list recovers.
 
 ## What the first runs showed
