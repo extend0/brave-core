@@ -282,10 +282,16 @@ DEFAULT_PROFILE = {
     "play_band": [2500, 250000],
     "min_like_rate": 0.030,
     "max_like_rate": 0.50,
-    "duration_band": [135, 345],
+    # 155s is the highest floor that costs no known positive. A graded round
+    # of labels suggested 200s (all 4 of its keeps were >=205s), but that
+    # contradicted the 8 earlier ones, half of which are 159-180s, and dropped
+    # --eval from 6/8 to 2/8. Short does not mean bad; only very short does.
+    # At 155s: 0 of 12 known positives lost, 4 of 19 known rejects cut.
+    "duration_band": [155, 345],
     "weights": {
         "nch": 0.47, "plw": 0.46, "screl": 0.39, "er": 0.32,
         "artw": 0.25, "ntags": 0.23, "lfol": -0.22, "lpf": 0.21,
+        "lkw": 0.25,
     },
 }
 
@@ -395,6 +401,35 @@ class Retriever:
       log(f"playlists: {len(chosen)} fetched, {self.n_lists} distinct; "
           f"{len(cand)} candidates")
 
+    # -- channel 4: shared audience -------------------------------------------
+    # Who likes the seed, and what else do those people like. This is the only
+    # channel keyed on *people* rather than on artists or lists, which is why
+    # it is the one that makes --negative work: subtracting it removes an
+    # audience, where subtracting the artist graph would remove an artist.
+    if a.likers_per_seed > 0:
+      voters = collections.defaultdict(set)
+      for tid, users in zip(sorted(seed_ids), self.c.pmap(
+          lambda t: self.c.collection(f"/tracks/{t}/likers", limit=200),
+          sorted(seed_ids))):
+        # Skip hoarders and bots: an indiscriminate liker says little.
+        picky = [u for u in users
+                 if a.liker_min_likes <= (u.get("likes_count") or 0)
+                 <= a.liker_max_likes]
+        picky.sort(key=lambda u: -(u.get("likes_count") or 0))
+        for u in picky[:a.likers_per_seed]:
+          voters[u["id"]].add(tid)
+      uids = sorted(voters, key=lambda u: -len(voters[u]))
+      for uid, items in zip(uids, self.c.pmap(
+          lambda u: self.c.collection(f"/users/{u}/likes", limit=100), uids)):
+        # Someone who liked several seeds is worth more than someone who
+        # liked one.
+        w = a.liker_weight * (len(voters[uid]) ** a.seed_hits_power)
+        for x in items:
+          t = x.get("track") if isinstance(x, dict) else None
+          if t and t.get("id") and t["id"] not in seed_ids:
+            self._add(cand, t["id"], "lk", w, t)
+      log(f"audience: {len(voters)} shared likers; {len(cand)} candidates")
+
     # -- channel 3: artist-similarity graph ----------------------------------
     if a.hops > 0:
       dist = {u: 0 for u in seed_uids}
@@ -445,6 +480,7 @@ def features(track, user, channels):
       "screl": 1.0 if "screl" in channels else 0.0,
       "er": likes / max(plays, 1),
       "artw": channels.get("art", 0.0),
+      "lkw": channels.get("lk", 0.0),
       "ntags": float(len(tags_of(track))),
       "lfol": math.log(followers),
       "lpf": math.log(max(plays, 1) / followers),
@@ -489,7 +525,7 @@ class Ranker:
       return False
     return True
 
-  def rank(self, client, seeds, cand, meta, exclude=()):
+  def rank(self, client, seeds, cand, meta, exclude=(), negcand=None):
     a = self.a
     seed_names = {norm(s.artist) for s in seeds}
     seed_uids = {s.uid for s in seeds}
@@ -497,6 +533,15 @@ class Ranker:
 
     # Channel agreement is the strongest single feature, so apply it before
     # hydrating: it drops the pool ~12x and saves most of the /tracks calls.
+    # Rocchio: how strongly the --negative seeds' own audience and curators
+    # vouch for this candidate. Scaled to its own max so it combines with the
+    # z-scored features rather than swamping them.
+    negcand = negcand or {}
+    negtotal = {tid: sum(ch.values()) for tid, ch in negcand.items()}
+    negmax = max(negtotal.values()) if negtotal else 1.0
+    def negweight(tid):
+      return (negtotal.get(tid, 0.0) / negmax) * a.negative_weight
+
     keep = {tid: ch for tid, ch in cand.items()
             if len(ch) >= a.min_channels and tid not in exclude}
     missing = [tid for tid in keep if tid not in meta]
@@ -526,7 +571,8 @@ class Ranker:
       seen.add(key)
       rows.append({
           "id": tid, "track": t, "user": u, "channels": channels,
-          "features": features(t, u, channels), "edit": is_edit,
+          "features": features(t, u, channels),
+          "negev": negweight(tid), "edit": is_edit,
       })
     if not rows:
       return []
@@ -542,8 +588,12 @@ class Ranker:
              / max(len(rows) - 1, 1))
       sd[k] = math.sqrt(var) or 1.0
     for r in rows:
-      r["score"] = sum(self.w[k] * (r["features"][k] - mean[k]) / sd[k]
-                       for k in keys)
+      # Rocchio: subtract the negative evidence AFTER z-scoring. Folding it in
+      # as a z-scored feature would make --negative-weight a no-op, since
+      # z-scoring divides out any scale applied to it.
+      r["score"] = (sum(self.w[k] * (r["features"][k] - mean[k]) / sd[k]
+                        for k in keys)
+                    - r["negev"])
     rows.sort(key=lambda r: -r["score"])
 
     # Cap per artist so one prolific curator cannot own the list.
@@ -752,6 +802,17 @@ def build_parser():
   g.add_argument("--limit", type=int, default=25, help="rows to print")
   g.add_argument("--per-artist", type=int, default=2,
                  help="max rows per artist (0 for no cap)")
+  g.add_argument("--negative", action="append", metavar="URL",
+                 help="a track or playlist of tracks you do NOT want; their "
+                      "evidence is subtracted from every candidate (Rocchio "
+                      "relevance feedback). Repeatable. Needs "
+                      "--likers-per-seed to do much, since the audience "
+                      "channel is the only one worth subtracting.")
+  g.add_argument("--negative-weight", type=float, default=2.0,
+                 help="lambda on the subtracted evidence. Only bites on the "
+                      "shared-audience channel, so it needs "
+                      "--likers-per-seed; subtracting the artist graph "
+                      "measurably hurts.")
   g.add_argument("--min-channels", type=int, default=2,
                  help="require agreement from this many retrieval channels; "
                       "2 drops the pool ~12x at no measured recall cost")
@@ -765,6 +826,18 @@ def build_parser():
                  help="skip tracks/{id}/related")
   g.add_argument("--no-playlists", dest="playlists", action="store_false",
                  help="skip playlist co-occurrence")
+  g.add_argument("--likers-per-seed", type=int, default=0,
+                 help="shared-audience channel: likers to sample per seed. "
+                      "Off by default: it roughly doubles the request count "
+                      "and triples the candidate pool for a gain that is "
+                      "within noise on the labels measured so far. Turn it on "
+                      "(e.g. 60) to make --negative effective; see the README.")
+  g.add_argument("--liker-weight", type=float, default=0.5,
+                 help="channel weight for the shared-audience channel")
+  g.add_argument("--liker-min-likes", type=int, default=20,
+                 help="ignore likers with fewer likes than this")
+  g.add_argument("--liker-max-likes", type=int, default=5000,
+                 help="ignore hoarders/bots with more likes than this")
   g.add_argument("--hops", type=int, default=2,
                  help="relatedartists hops to walk (0 disables the channel)")
   g.add_argument("--fan", type=int, default=10,
@@ -845,7 +918,8 @@ def main():
   seeds, what = load_seeds(client, args.url, args.max_seeds)
   log(f"seeds: {what}")
 
-  enabled = sum((bool(args.related), bool(args.playlists), args.hops > 0))
+  enabled = sum((bool(args.related), bool(args.playlists), args.hops > 0,
+                 args.likers_per_seed > 0))
   if not enabled:
     sys.exit("all retrieval channels are disabled; nothing to do")
   if args.min_channels > enabled:
@@ -873,7 +947,23 @@ def main():
 
   retriever = Retriever(client, args, profile)
   cand = retriever.retrieve(seeds)
-  rows = Ranker(args, profile).rank(client, seeds, cand, dict(retriever.meta))
+
+  negcand, negseeds = None, []
+  if args.negative:
+    for url in args.negative:
+      got, label = load_seeds(client, url, args.max_seeds)
+      negseeds.extend(got)
+      log(f"negative: {label}")
+    negcand = Retriever(client, args, profile).retrieve(negseeds)
+    log(f"negative evidence over {len(negcand)} candidates "
+        f"from {len(negseeds)} disliked track(s)")
+
+  meta = dict(retriever.meta)
+  # Never recommend a disliked track back, nor anything by an artist whose
+  # track was explicitly rejected.
+  drop = {s.id for s in negseeds}
+  rows = Ranker(args, profile).rank(client, seeds, cand, meta,
+                                    exclude=drop, negcand=negcand)
 
   if args.json:
     print(json.dumps({
@@ -886,8 +976,15 @@ def main():
     print_table(
         f"{args.kind} · {lo}-{fmt_num(hi)} followers, "
         f"like rate >= {100 * profile['min_like_rate']:.1f}%, "
-        f"{args.min_channels}+ channels "
-        f"(ch: a=artist graph, p=playlist, s=sc-related)",
+        f"{args.min_channels}+ channels"
+        + (f", -{args.negative_weight:g}x {len(negseeds)} neg"
+           if negseeds else "")
+        + " (ch: " + ", ".join(
+            n for n, on in (("s=sc-related", args.related),
+                            ("p=playlist", args.playlists),
+                            ("a=artist", args.hops > 0),
+                            ("l=audience", args.likers_per_seed > 0)) if on)
+        + ")",
         rows, args.limit, args.url_lines)
 
   log(f"\napi calls: {client.calls} (cache hits: {client.cache_hits}); "

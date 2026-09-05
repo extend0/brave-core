@@ -8,6 +8,7 @@ built into the browser.
 ```
 python3 scdiscover.py https://soundcloud.com/someone/some-track
 python3 scdiscover.py <playlist-url> --kind remix
+python3 scdiscover.py <url> --negative <playlist-you-dislike>
 python3 scdiscover.py <playlist-url> --fit taste.json     # learn your bands
 python3 scdiscover.py <url> --profile taste.json          # use them
 python3 scdiscover.py <playlist-url> --eval               # measure recall
@@ -65,12 +66,25 @@ single best predictor of a hand-labelled positive set.
    the pool ~12x at no measured recall cost. `--per-artist` caps rows per
    artist so one prolific curator cannot own the list.
 
-5. **Fit** (`--fit OUT`) treats a playlist of tracks you like as labelled
+5. **Subtract what you rejected** (`--negative URL`, opt-in). The same
+   retrieval runs over tracks you did not want and their evidence is
+   subtracted from every candidate (Rocchio relevance feedback,
+   `--negative-weight`). This only bites on the **shared-audience** channel
+   (`--likers-per-seed`, off by default), which is keyed on people rather
+   than on artists or lists. Subtracting the artist graph measurably *hurts*,
+   because it removes an artist rather than an audience — a rejected track
+   and a kept track by the same editor are tightly linked in that graph. Note
+   what survives: a rejected track's author can still be recommended for a
+   different track, which is usually what you want. See
+   [Negative feedback](#negative-feedback) for the measurements and why it is
+   not on by default.
+
+6. **Fit** (`--fit OUT`) treats a playlist of tracks you like as labelled
    positives: it derives the envelope from their own spread (widened by
    `--fit-margin`), then runs leave-one-out to measure how well each feature
    separates them from the pool, and writes both to a JSON profile.
 
-6. **Evaluate** (`--eval`) hides each playlist member in turn, recommends from
+7. **Evaluate** (`--eval`) hides each playlist member in turn, recommends from
    the rest, and reports the rank the hidden track comes back at.
 
 ## What the measurements showed
@@ -92,7 +106,26 @@ outranks a random pool member on that feature alone:
 | `lplays` raw play count | 0.509 | — | — | **no signal** |
 | `tov` seed/candidate tag overlap | 0.433 | 0.05 | 0.11 | **anti-correlated** |
 
-Two of these overturned earlier design choices. Raw play count carries no
+A second, graded round of labels (4 keeps / 19 rejects, drawn from this
+tool's own output) added two findings.
+
+The **duration floor** rose from 135s to 155s. All four keeps in that round
+were 205s or longer, which argued for a 200s floor, and taken alone it looked
+clean: 4/4 keeps retained, 7/19 rejects cut. It was wrong. Half the earlier
+8-track labelled set is 159–180s, so a 200s floor discards four known
+positives and dropped `--eval` from 6/8 to **2/8**. Short does not mean bad;
+only very short does. 155s is the highest floor that costs no known positive
+(0/12 lost, 4/19 rejects cut) and it improved every recovered rank
+(`recall@50` 5/8 → 6/8). Fitting a threshold on the newest labels alone is
+how you lose the older ones.
+
+`waveform_url`, which exposes 1,800 amplitude samples per track, turned out
+to be **useless**: loudness, dynamic range, crest factor, quiet fraction,
+intro length and percussive flux all put the keepers' range entirely inside
+the rejects' range. It is a smoothed visual envelope, not audio, and there is
+no BPM field. That idea is not in the tool.
+
+Two of the table's rows overturned earlier design choices. Raw play count carries no
 signal at all once inside the band, so the old `plays^0.5` normalisation was
 doing nothing. Tag *overlap* is actively harmful — generic tags like "edit"
 and "club" match everything — while the *number* of tags is a decent quality
@@ -101,9 +134,45 @@ proxy. Both are reflected in the shipped weights; neither is a filter.
 The labelled set was also far narrower than the defaults it replaced: 674–5,316
 followers, where the previous version allowed up to 200,000.
 
-Recall on that set, ranking ~180 candidates per fold: **6/8 recovered, 5/8
-inside the top 50**, versus a 2% rate for chance. Re-fitting with `--fit`
-improved every recovered rank (`recall@50` 5/8 → 6/8).
+Recall on that set, ranking ~180 candidates per fold: **6/8 recovered, all
+6 inside the top 50**, versus a 2% rate for chance (ranks 3, 17, 24, 27, 32,
+43).
+
+## Negative feedback
+
+Rejections are cheap to produce, so `--negative` looked like the best
+available lever. Measured on the graded round — can the ranker put the 4
+keeps above the 19 rejects, leave-one-out, 76 pairwise comparisons? — it
+mostly is not:
+
+| configuration | AUC |
+|---|---|
+| default channels, no negatives | **0.721** |
+| default channels, subtracting playlist or sc-related evidence | 0.721 (flat) |
+| default channels, subtracting the **artist graph** | 0.691 → 0.676 (worse) |
+| **+ shared-audience channel**, no negatives | 0.691 |
+| **+ shared-audience channel**, subtracting it (λ=2–3) | **0.750** |
+
+So subtracting an audience does move the ranking the right way,
+monotonically in λ. But the net gain over simply not doing any of it is
+0.721 → 0.750, bought with roughly double the requests and triple the
+candidate pool. With 4 positives one swapped pair is worth 0.013 AUC, so
++0.029 is about two pairs — inside the noise. Both the channel and the
+subtraction are therefore **off by default** and kept as an opt-in
+(`--likers-per-seed 60 --negative <url>`) pending a larger labelled set.
+
+Two process notes, since both cost real time:
+
+- An earlier prototype of this measured 0.697 → 0.855 and that number did
+  **not** replicate in the tool. The prototype had no popularity envelope, no
+  per-artist cap and no z-scoring, and it scored every candidate. Its channel
+  mix was also different (likers, not the artist graph). A number measured
+  outside the pipeline it is meant to justify should not be trusted.
+- The first implementation folded the subtraction in as a z-scored feature,
+  which silently made `--negative-weight` a **no-op**: z-scoring divides out
+  any scale applied to its input, so every λ above 0 gave identical results.
+  It is now subtracted after z-scoring. The tell was a sweep whose columns
+  were all identical.
 
 ## Known limits
 
@@ -116,6 +185,19 @@ improved every recovered rank (`recall@50` 5/8 → 6/8).
   recoverable positives, not a fitted regression: the feature *ordering* is
   robust, the exact values are not. A labelled set of 30–50 tracks would
   support fitting them properly.
+- **The graded round is 4 positives.** The duration floor and the direction
+  of the audience effect are the only things it can really support; it cannot
+  fit weights. More *keeps* are the binding constraint — 19 rejects is
+  already plenty.
+- **Every feature is social; taste is musical.** The features describe who
+  liked a track, who filed it, and how big its artist is. None describe how
+  it sounds. The clearest evidence is a pair from the graded round: one
+  Kendrick Lamar club edit was a keeper and another was a reject — both
+  ~250s, both by mid-band editors — and the top keeper's own editor also made
+  a rejected track. No reachable metadata separates those, so the residual
+  error is largely within-artist song selection. Closing it would need real
+  audio decoding, which costs the dependency-free property and does not
+  transfer to the browser.
 - **Unofficial API.** `api-v2` and the scraped client ID are what the web
   client uses; the ID rotates every few weeks. Inside the browser this goes
   away: a soundcloud.com page script already has the ID and the user's
