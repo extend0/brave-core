@@ -1,17 +1,16 @@
-# SoundCloud crowd discovery prototype
+# SoundCloud discovery prototype
 
-A local, dependency-free experiment in recommending SoundCloud tracks from
-*what other people file next to your music* instead of from SoundCloud's own
-recommendation engine. It exists to answer "is this signal useful?" before any
-of it is built into the browser. Each run prints four lists: SoundCloud's own
-related tracks as a baseline, raw crowd picks, a popularity-normalised
-up-and-coming list, and a time-decayed "rising" list built from what people
-with your taste liked or reposted recently.
+A local, dependency-free experiment in recommending SoundCloud tracks that are
+good but not chart-topping: the mid-band artists you would otherwise only find
+by browsing. It exists to answer "is this signal useful?" before any of it is
+built into the browser.
 
 ```
-python3 scdiscover.py https://soundcloud.com/oklou93/just-level-5-cause-its-kinda-cool
-python3 scdiscover.py https://soundcloud.com/someone/sets/some-playlist --holdout 0.2
-python3 scdiscover.py <url> --json --limit 50 > out.json
+python3 scdiscover.py https://soundcloud.com/someone/some-track
+python3 scdiscover.py <playlist-url> --kind remix
+python3 scdiscover.py <playlist-url> --fit taste.json     # learn your bands
+python3 scdiscover.py <url> --profile taste.json          # use them
+python3 scdiscover.py <playlist-url> --eval               # measure recall
 python3 scdiscover.py --help
 ```
 
@@ -20,123 +19,121 @@ re-running with different scoring flags is free; delete the directory or pass
 `--no-cache` to refetch. The API client ID is scraped from SoundCloud's web
 bundles on first run and refreshed automatically when it stops working.
 
+A typical run is **~500 requests in ~11 seconds**.
+
 ## How it works
 
+Three independent retrieval channels, then one ranking pass. Candidates that
+several channels agree on win, because channel agreement turned out to be the
+single best predictor of a hand-labelled positive set.
+
 1. **Resolve** the URL to a track (one seed) or a playlist (all its tracks are
-   seeds; playlists over `--max-seeds` are sampled).
-2. **Expand** through the internal `api-v2` endpoints the web player uses:
-   - `tracks/{id}/playlists_without_albums` – every public set the seed is in.
-     Sets outside `--min/--max-playlist-size` are skipped and the remainder are
-     ordered by closeness to ~80 tracks, which is where hand-curated sets live.
-   - `playlists/{id}` + `tracks?ids=` – a set returns 5 full tracks and the
-     rest as id stubs; stubs are hydrated 50 per call, so a 500-track set costs
-     11 requests. This is how the "hundreds of hidden tracks" become visible.
-   - `tracks/{id}/likers` → `users/{id}/likes` (optional, `--likers-per-seed`)
-     – a heavy liker's likes list is treated as a pseudo-playlist.
-   - `tracks/{id}/likers`, `tracks/{id}/reposters` → `users/{id}/likes`,
-     `stream/users/{id}/reposts` – timestamped adoption events, for the
-     rising list.
-   - `tracks/{id}/related` – SoundCloud's own recommendations, used only as
-     the baseline column.
-3. **Score** every non-seed track:
-   - Each list gets weight `seed_hits^1.5 / ln(size + 10)`. A set containing
-     four of your seeds is worth far more than four sets containing one each.
-   - Lists containing more than `--max-seed-fraction` of the seeds are copies
-     of the input playlist and are dropped. Lists that overlap each other by
-     `--dedupe-jaccard` or more are merged into one: SoundCloud playlists get
-     copied wholesale, and one run found the same "Synthwave | Nightdrive
-     Vibes" set under six accounts, which had pushed its 1k-play filler to the
-     top of the up-and-coming list.
-   - `raw` = sum of list weights → **Crowd picks**.
-   - `upcoming` = `raw / plays^0.5 / followers^0.25 * recency` → **Up and
-     coming**, additionally restricted to tracks that appear in lists from at
-     least two *different people*, have at least 1k plays, and sit in the
-     less-played / smaller-artist half of the candidate pool. For playlists of
-     10+ tracks a pick must also share one list with at least two seeds
-     (`--min-seed-hits`), which keeps single-seed off-genre lists out.
-   - Tracks by the seed artists are excluded and each artist is capped at two
-     rows (`--include-seed-artists`, `--per-artist`).
-4. **Rising** uses the one time series the API does expose. Play counts
-   have no history and comments are too sparse, but every like and repost
-   event carries a timestamp. The tool finds *taste neighbours*: people who
-   liked or reposted several of the seeds, weighted by how many and diluted
-   by how indiscriminate they are (hoarders and bots are excluded). It then
-   reads each neighbour's latest likes and reposts and scores each track by
-   `sum(neighbour_weight * kind * 0.5^(event_age / half_life))`, reposts
-   counting double. That base is multiplied by velocity (plays per day of
-   life relative to the pool, so a four-month-old 60k track beats a 2019
-   400k one), by concentration (neighbours who adopted it divided by the log
-   of its total likes, so a track breaking in *your* scene beats one
-   breaking everywhere), and by a bonus when the playlist pass saw it too.
-   Playlist placements from the co-occurrence pass vote too, at half
-   weight: a track in the last quarter of a recently modified list is dated
-   to that modification, everything else to the midpoint of the list's life.
-   Merging the sources roughly quintupled the list, because a track liked by
-   one neighbour and filed by one curator now has two people behind it.
-   The play band (`--rising-min/max-plays`, 5k to 1M) sits deliberately
-   above up-and-coming: this is the point on the curve where a track has
-   traction but is not yet everywhere. Tracks older than three years or by
-   artists with 500k+ followers are left to the other lists. Columns `last`
-   and `speed` show days since the newest neighbour event and the velocity
-   multiple.
-   **Snowball.** Tracks that three or more first-round neighbours converged
-   on are treated as extra seeds: their likers and reposters are collected
-   too, ranked by how many of those tracks they touched, and their feeds are
-   read at reduced weight (`--snowball-*`). These are people the original
-   seeds could never have reached, selected for taste rather than for
-   happening to like one track. It roughly doubles the neighbour pool.
-5. **Cluster** (`--clusters auto`, off by default): seeds are linked when
-   they share a playlist or a liker, connected groups become taste clusters,
-   and each cluster plus each unlinked seed gets its own rising pass after
-   the overall lists. It helps on a mixed playlist, whose seeds cancel each
-   other out when scored together, but every group is another neighbour
-   pass, so an 8-track grab bag cost roughly 1,500 requests and 15 minutes.
-   Left opt-in for that reason.
-6. **Evaluate** (playlists only, `--holdout`): hide a fraction of the playlist,
-   recommend from the rest, report how many hidden tracks each list recovers.
+   seeds, sampled down to `--max-seeds`).
 
-## What the first runs showed
+2. **Retrieve** through the internal `api-v2` endpoints the web player uses:
 
-Seed: Oklou, "just level 5 cause its cute" (single track, ~40 lists, ~90
-calls). SoundCloud's related list is mostly Oklou's own tracks and remixes.
-Crowd picks surface the scene around her (Eartheater, underscores, SOPHIE,
-Sega Bodega, Frost Children). Up and coming surfaces sub-10k-play tracks that
-two or more unrelated curators filed next to the seed, which is the discovery
-signal the platform does not expose.
+   - `tracks/{id}/related` — SoundCloud's own related tracks, one call per
+     seed. The highest-precision channel by a wide margin: it held **83% of
+     the labelled positives while making up 5% of the candidate pool**. The
+     earlier version of this tool fetched it only to print as a baseline
+     column to beat, and threw the candidates away.
+   - `tracks/{id}/playlists_without_albums` → `playlists/{id}` — the public
+     sets a seed sits in, fetched **as track ids only**. `playlists/{id}`
+     returns every member as at least an `{id}` stub, so a 500-track set costs
+     one request rather than eleven. Sets are filtered by size, ordered by
+     closeness to `--playlist-sweet-spot`, and near-duplicates are collapsed
+     (`--dedupe-jaccard`) because SoundCloud playlists get copied wholesale and
+     six copies of one set must count as one person's opinion.
+   - `users/{id}/relatedartists` → `users/{id}/tracks` — SoundCloud's own
+     artist-similarity graph, walked `--hops` hops with `--fan` neighbours
+     each, keeping only artists inside the follower band. One call returns ten
+     genuinely adjacent mid-band artists; this is the cheapest way into a
+     scene.
 
-Playlist holdout on an eclectic 49-track set (9 tracks hidden): once copied
-playlists were removed, no method placed a hidden track in its top 25. With a
-3x budget (120 sets, ~6,300 candidates) crowd picks recovered 2 of 9 somewhere
-in the ranking and SoundCloud's related list 0 of 9. A mixed-genre playlist is
-the hardest case, since its neighbours split into unrelated clusters; run
-`--holdout` on a few coherent, personally curated playlists before drawing
-conclusions.
+3. **Filter** to a popularity envelope. These are hard bands, not soft
+   penalties — a soft penalty lets a 3.5M-follower artist through whenever
+   co-occurrence is strong enough, which is exactly how the previous version
+   ended up recommending Bad Bunny. Also dropped: uploads that are not single
+   tracks (edit packs, drum kits, podcasts, DJ sets), tracks outside the
+   duration window, re-upload/aggregator accounts (huge catalogue, few
+   followers), and any track with a seed artist's name in its title — a
+   re-upload of the seed artist is not a discovery, whoever posted it.
+
+4. **Rank** by a weighted sum of z-scored features, so a score means "unusual
+   for this candidate pool, in the directions that predicted the labelled
+   set". `--min-channels 2` requires agreement from two channels, which drops
+   the pool ~12x at no measured recall cost. `--per-artist` caps rows per
+   artist so one prolific curator cannot own the list.
+
+5. **Fit** (`--fit OUT`) treats a playlist of tracks you like as labelled
+   positives: it derives the envelope from their own spread (widened by
+   `--fit-margin`), then runs leave-one-out to measure how well each feature
+   separates them from the pool, and writes both to a JSON profile.
+
+6. **Evaluate** (`--eval`) hides each playlist member in turn, recommends from
+   the rest, and reports the rank the hidden track comes back at.
+
+## What the measurements showed
+
+Fitted against an 8-track hand-labelled playlist (18,414 viable candidates
+across 8 leave-one-out folds). `AUC` is the probability a labelled track
+outranks a random pool member on that feature alone:
+
+| feature | AUC | labelled | pool | |
+|---|---|---|---|---|
+| `nch` channels agreeing | 0.966 | 2.50 | 1.11 | strongest signal |
+| `plw` playlist co-occurrence weight | 0.959 | 0.88 | 0.28 | |
+| `screl` in SoundCloud's related | 0.892 | 0.83 | 0.05 | |
+| `er` like rate | 0.815 | 7.1% | 5.2% | |
+| `artw` artist-graph weight | 0.751 | 0.45 | 0.13 | |
+| `ntags` tag count | 0.733 | 9.2 | 5.2 | proxy for upload care |
+| `lpf` plays per follower | 0.708 | 2.59 | 1.80 | overperforms its audience |
+| `lfol` log followers | 0.282 | ~1.5k | ~3.2k | inverted: smaller wins |
+| `lplays` raw play count | 0.509 | — | — | **no signal** |
+| `tov` seed/candidate tag overlap | 0.433 | 0.05 | 0.11 | **anti-correlated** |
+
+Two of these overturned earlier design choices. Raw play count carries no
+signal at all once inside the band, so the old `plays^0.5` normalisation was
+doing nothing. Tag *overlap* is actively harmful — generic tags like "edit"
+and "club" match everything — while the *number* of tags is a decent quality
+proxy. Both are reflected in the shipped weights; neither is a filter.
+
+The labelled set was also far narrower than the defaults it replaced: 674–5,316
+followers, where the previous version allowed up to 200,000.
+
+Recall on that set, ranking ~180 candidates per fold: **6/8 recovered, 5/8
+inside the top 50**, versus a 2% rate for chance. Re-fitting with `--fit`
+improved every recovered rank (`recall@50` 5/8 → 6/8).
 
 ## Known limits
 
+- **Two of eight labelled tracks are unreachable.** They are recovered by no
+  channel — not related-artists, not playlists, not likers, not tag search.
+  One sits at 4k plays with no graph edges to the rest of the set. A
+  co-occurrence system structurally cannot find those, and no amount of
+  tuning changes it.
+- **The weights are coarse.** They are signed AUC separations from six
+  recoverable positives, not a fitted regression: the feature *ordering* is
+  robust, the exact values are not. A labelled set of 30–50 tracks would
+  support fitting them properly.
 - **Unofficial API.** `api-v2` and the scraped client ID are what the web
   client uses; the ID rotates every few weeks. Inside the browser this goes
   away: a soundcloud.com page script already has the ID and the user's
-  session.
-- **Rate limits are unknown.** Runs of ~200 calls at 0.15s spacing were fine.
-  Budget is controlled by `--max-playlists`, `--playlists-per-seed`,
-  `--max-seeds`; each hydrated set costs `1 + size/50` calls.
-- **Popularity bias vs. noise.** Raw co-occurrence favours anthems; the
-  normalised list can favour junk. The distinct-people requirement and the
-  play floor are what keep it honest; tune `--popularity-power`,
-  `--artist-power`, `--min-contexts`.
-- **Dates lie.** `created_at` is the upload time; reuploads of old tracks
-  look brand new. The tool uses the earliest of `display_date`,
-  `release_date` and `created_at`, and drops tracks with more likes than half
-  their plays, a bought-engagement signature seen on one such reupload.
-- **No audio or genre features.** Everything is graph structure. Genre tags
-  are carried in the JSON output for a later filter.
+  session. `relatedartists` is as unofficial as the rest, which is why the
+  playlist channel is worth keeping as a fallback.
+- **Rate limits.** None observed: 2.3 req/s serial against 43 req/s at 32
+  threads with zero 429s. `--workers` defaults to a conservative 24.
+- **Reupload-heavy genres stay hard.** Where a scene is dominated by
+  aggregator accounts, the filters help but do not win outright.
+- **Dates and audio.** Nothing here uses release dates (`created_at` is upload
+  time, so reuploads look new) or audio features. It is all graph structure
+  plus the popularity envelope.
 
 ## Path to the browser
 
-The scoring is a few hundred lines of arithmetic over JSON the page can fetch
+The ranking is a few hundred lines of arithmetic over JSON the page can fetch
 itself. The natural home is the existing soundcloud.com page script on iOS
-(`SoundCloudScript.js`), which already reaches into the site's player; it
-could seed from the playlist being viewed, run the expansion with the page's
-own credentials, and offer the up-and-coming list as a "Discover from this
-playlist" action. Evaluate with `--holdout` on real user playlists first.
+(`SoundCloudScript.js`), which already reaches into the site's player; it could
+seed from the playlist being viewed, run the retrieval with the page's own
+credentials, and offer the result as a "Discover from this playlist" action.
+The user's own likes are the obvious labelled set to fit against.
